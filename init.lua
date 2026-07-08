@@ -1,8 +1,27 @@
 bestguns = {
     registered_guns = {},
     registered_bullets = {},
-    last_fire = {} -- Tracks cooldowns: [player_name] = timestamp
+    last_fire = {}, -- Tracks cooldowns: [player_name] = timestamp
+    burst_start = {}, -- First-shot-accuracy ramp: [player_name] = burst start time
+    bursting = {}, -- Burst-fire lock: [player_name] = true while a burst is in progress
+
+    -- Global multiplier applied to all bullet damage. CTF (and any game that
+    -- scales player HP up) leaves this at 1; standalone/vanilla-HP games can
+    -- lower it (e.g. 0.1) so guns tuned for 200 HP don't one-shot a 20-HP player.
+    damage_scale = 1,
+
+    -- Sounds played to the shooter when a bullet lands on a target. Point these
+    -- at your own ogg files (drop them in sounds/), or set to nil to disable.
+    -- Defaults expect sounds/bestguns_hit.ogg and sounds/bestguns_headshot.ogg.
+    hit_sound = "bestguns_hit",
+    headshot_sound = "bestguns_headshot",
 }
+
+-- Overridable hook: return false to forbid a player from firing a given gun.
+-- Used by game integrations (e.g. CTF class restrictions). Defaults to allow.
+function bestguns.can_use_gun(player, gun_name)
+    return true
+end
 
 function bestguns.scope(player, enable, itemstack, zoom_cancel)  
   local name = player:get_player_name()
@@ -22,8 +41,8 @@ function bestguns.scope(player, enable, itemstack, zoom_cancel)
     bestguns[name].hud_removing = 0.1
   end
 
-  playerphysics.remove_physics_factor(player, "speed", "bestguns:aiming_speed")
-  
+  bestguns.playerphysics.remove_physics_factor(player, "speed", "bestguns:aiming_speed")
+
   if enable == "kick" then
     player:set_fov((gundef.kick or 2.04)-1, true, 0.1)
     return
@@ -40,9 +59,9 @@ function bestguns.scope(player, enable, itemstack, zoom_cancel)
     player:set_fov(gundef.zoom, true, 0.3)
   end
   
-  playerphysics.add_physics_factor(player, "speed", "bestguns:aiming_speed", 0.8)
-  
-  
+  bestguns.playerphysics.add_physics_factor(player, "speed", "bestguns:aiming_speed", 0.8)
+
+
   if not gundef.zoomhud then return end
   bestguns[name].hud = {}
   bestguns[name].hud[1] = player:hud_add({
@@ -110,10 +129,37 @@ end
 
 
 
-local BULLETLOADSPEED = 0.5
+-- Shared muzzle/impact smoke helper. Part of the public API so gun packs (the
+-- built-in real_register, battlefront_register, or any external mod) can reuse
+-- the same smoke look from their on_fire callbacks.
+function bestguns.a_smoke(user, def)
+  local look_dir = user:get_look_dir()
+  local pos = user:get_pos()
+  pos.y = pos.y + 1.5
+  def.minsmokes = def.minsmokes or 10
+  def.max_smokes = def.max_smokes or 25
+
+  if not def.acceleration then def.acceleration = {x=8, y=8, z=8} end
+  for i=1, math.random(def.minsmokes,def.max_smokes) do
+    core.add_particle({
+      pos = vector.add(pos, vector.multiply(look_dir, 0.5)),
+      velocity = user:get_velocity(),
+      acceleration = {x=bestguns.r(def.acceleration.x), y=bestguns.r(def.acceleration.y), z=bestguns.r(def.acceleration.z)},
+      expirationtime = math.random((def.expirationtime or 0.6)*10)/10,
+      size = math.random(def.size or 8),
+      texture = def.texture or "bestguns_smoke_"..math.random(3)..".png^[opacity:"..(def.base_opacity or 20).."^[contrast:0:"..math.random((def.smoke_min_brightness or -20), 0),
+      glow = math.random(def.glow or 3)
+    })
+  end
+end
+
+
+local BULLETLOADSPEED = 1
 
 -- Load components
 local path = core.get_modpath("bestguns")
+-- Resolve controls + playerphysics (reuse globals if present, else bundle them)
+dofile(path .. "/compat.lua")
 dofile(path .. "/entity.lua")
 
 
@@ -133,7 +179,7 @@ local function update_mag_desc(itemstack, gun_name)
     local inv_image = mag_def.inventory_image
     
 
-    local desc = def.description .. " Magazine\n"
+    local desc = def.description .. " " .. (def.mag_term or "Magazine") .. "\n"
     if ammo > 0 and b_def then
         desc = desc .. ammo .. "/" .. def.mag_capacity .. " x " .. (b_def.description or b_name)
     else
@@ -180,6 +226,40 @@ local function update_gun_desc(itemstack, def)
     meta:set_string("inventory_image", inv_image)
     
     
+end
+
+-- Public helpers for external mods (loot generation, giving loaded guns, etc.)
+
+-- Put a gun ItemStack into a loaded state. Magazine-fed guns get a magazine
+-- inserted automatically. Returns the (modified) itemstack.
+function bestguns.fill_gun(itemstack, ammo_count, bullet_name)
+    local def = bestguns.registered_guns[itemstack:get_name()]
+    if not def then return itemstack end
+
+    local meta = itemstack:get_meta()
+    meta:set_int("ammo_count", ammo_count)
+    meta:set_string("bullet_name", bullet_name or def.default_bullet)
+    meta:set_int("is_open", 0)
+    if def.load_action == "magazine" then
+        meta:set_int("has_mag", 1)
+    end
+
+    update_gun_desc(itemstack, def)
+    return itemstack
+end
+
+-- Build a loaded magazine ItemStack for a magazine-fed gun.
+function bestguns.make_mag(gun_name, ammo_count, bullet_name)
+    local def = bestguns.registered_guns[gun_name]
+    if not def or def.load_action ~= "magazine" then return ItemStack("") end
+
+    local stack = ItemStack(gun_name .. "_mag")
+    local meta = stack:get_meta()
+    meta:set_int("ammo_count", ammo_count)
+    meta:set_string("bullet_name", bullet_name or def.default_bullet)
+
+    update_mag_desc(stack, gun_name)
+    return stack
 end
 
 function bestguns.can_fire(itemstack, user)
@@ -232,7 +312,26 @@ function bestguns.fire_gun(itemstack, user)
     local now = core.get_us_time() / 1000000
     local last_fire = bestguns.last_fire[player_name] or 0
     if now - last_fire < def.fire_delay then return nil end
-    
+
+    -- First-shot accuracy: a burst starts pinpoint and blooms up to the gun's
+    -- set `inaccuracy` over 0.3s of sustained fire. Pausing (>0.15s gap between
+    -- shots) resets the burst, so the next shot is dead-on again. Semi/single
+    -- guns naturally reset between shots; full-auto spray blooms as you hold.
+    if now - last_fire > 0.15 then
+        bestguns.burst_start[player_name] = now
+    end
+    local burst_start = bestguns.burst_start[player_name] or now
+    local bloom = math.min((now - burst_start) / 0.3, 1)
+
+    -- Respect external usage restrictions (e.g. CTF class limits)
+    if not bestguns.can_use_gun(user, gun_name) then
+        bestguns.last_fire[player_name] = now
+        if def.sound_empty then
+            core.sound_play(def.sound_empty, {pos = user:get_pos(), max_hear_distance = 16}, true)
+        end
+        return nil
+    end
+
     
     if def.cancel_scope_on_fire then
       bestguns.scope(user)
@@ -283,7 +382,8 @@ function bestguns.fire_gun(itemstack, user)
     -- Spawn Bullet Entity
     local eye_height = user:get_properties().eye_height or 1.625
     local pos = vector.add(user:get_pos(), {x=0, y=eye_height, z=0})
-    local bullet_vel = vector.multiply(vector.offset(dir, bestguns.r(100)/5000*def.inaccuracy, bestguns.r(100)/5000*def.inaccuracy, bestguns.r(100)/5000*def.inaccuracy), b_def.speed or 100)
+    local eff_inaccuracy = def.inaccuracy * bloom
+    local bullet_vel = vector.multiply(vector.offset(dir, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy), b_def.speed or 100)
 
     if def.on_fire then
       if def.on_fire(itemstack, user, obj) then
@@ -303,7 +403,7 @@ function bestguns.fire_gun(itemstack, user)
         shooter_name = player_name,
         _item = bullet_name,
         _drops = b_def.drops,
-        damage = b_def.damage or 1,
+        damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale),
         texture = b_def.texture,
         size = b_def.size or 1
     }))
@@ -313,32 +413,80 @@ function bestguns.fire_gun(itemstack, user)
     return itemstack
 end
 
+-- Burst fire: one trigger pull sends a fixed number of rounds (default 3) spaced
+-- by `burst_delay`, then locks out re-triggering until the burst finishes plus a
+-- short `burst_cooldown`. Holding the trigger simply repeats bursts at that
+-- cadence. Each round runs through fire_gun, so ammo, spread bloom, recoil, and
+-- sounds all behave exactly like a normal shot.
+function bestguns.fire_burst(itemstack, user)
+    local name = user:get_player_name()
+    local gun_name = itemstack:get_name()
+    local def = bestguns.registered_guns[gun_name]
+
+    if bestguns.bursting[name] then return nil end
+
+    -- Fire the first round immediately; bail (no lock) if it couldn't fire
+    -- (empty mag, cooldown, action restriction, etc.).
+    local first = bestguns.fire_gun(itemstack, user)
+    if not first then return nil end
+
+    local shots = def.burst_count or 3
+    local interval = def.burst_delay or 0.07
+    bestguns.bursting[name] = true
+
+    local function shoot(i)
+        if i > shots then
+            core.after(def.burst_cooldown or 0.15, function()
+                bestguns.bursting[name] = nil
+            end)
+            return
+        end
+        local player = core.get_player_by_name(name)
+        if not player then bestguns.bursting[name] = nil return end
+        local wielded = player:get_wielded_item()
+        if wielded:get_name() ~= gun_name then bestguns.bursting[name] = nil return end
+        local new_stack = bestguns.fire_gun(wielded, player)
+        if new_stack then player:set_wielded_item(new_stack) end
+        core.after(interval, function() shoot(i + 1) end)
+    end
+    core.after(interval, function() shoot(2) end)
+
+    return first
+end
+
 -- Bullet Registration
 function bestguns.register_bullet(name, def)
     bestguns.registered_bullets[name] = def
-    core.register_craftitem(name, {
+    local groups = {bullet = 1}
+    if def.not_in_creative_inventory then
+        groups.not_in_creative_inventory = 1
+    end
+    -- Leading ":" overrides the modname-prefix check, so gun packs loaded as
+    -- their own mods (bestguns_guns, battlefront_blasters, ...) may register
+    -- "bestguns:"-namespaced items through this API.
+    core.register_craftitem(":" .. name, {
         description = def.description,
         inventory_image = def.inventory_image,
-        groups = {bullet = 1}
+        groups = groups
     })
 end
 
 
 
 local reload_timer = {}
-controls.register_on_press(function(player, key)
+bestguns.controls.register_on_press(function(player, key)
   local ctrl = player:get_player_control()
   local wielditem = player:get_wielded_item()
   if core.get_item_group(wielditem:get_name(), "bestguns_gun") == 0 then return end
   if key == "RMB" and not ctrl.LMB and not ctrl.sneak then bestguns.scope(player, true, wielditem) end
 end)
-controls.register_on_release(function(player, key, length)
+bestguns.controls.register_on_release(function(player, key, length)
   if key == "RMB" then bestguns.scope(player) end
   if key ~= "RMB" then return end
   reload_timer[player:get_player_name()] = 0
-  playerphysics.remove_physics_factor(player, "speed", "bestguns:loading_speed")
+  bestguns.playerphysics.remove_physics_factor(player, "speed", "bestguns:loading_speed")
 end)
-controls.register_on_hold(function(user, key, length)
+bestguns.controls.register_on_hold(function(user, key, length)
   if key ~= "RMB" then return end
   local itemstack = user:get_wielded_item()
   local stackname = itemstack:get_name() or "ignore"
@@ -364,10 +512,10 @@ controls.register_on_hold(function(user, key, length)
   
   local ammo_count = meta:get_int("ammo_count")
   if ammo_count < def.mag_capacity then
-    playerphysics.add_physics_factor(user, "speed", "bestguns:loading_speed", 0.3)
+    bestguns.playerphysics.add_physics_factor(user, "speed", "bestguns:loading_speed", 0.3)
     
     if length - reload_timer[name] < loadspeed then return end
-    reload_timer[name] = 100 -- player must either wait 100 seconds or release and press again  
+    reload_timer[name] = length -- keep loading the next bullet each loadspeed interval while RMB stays held
     
     local current_bullet = meta:get_string("bullet_name")
     local bullets_needed = 1
@@ -440,8 +588,8 @@ function bestguns.register_gun(name, def)
     local rightclick_function = function(itemstack, user, pointed_thing) end
     
     if ma then
-      core.register_craftitem(mag_name, {
-          description = def.description .. " Magazine\nEmpty",
+      core.register_craftitem(":" .. mag_name, {
+          description = def.description .. " " .. (def.mag_term or "Magazine") .. "\nEmpty",
           inventory_image = def.texture_mag_item or def.texture_mag,
           wield_image = def.texture_mag_item or def.texture_mag,
           groups = {gun_magazine = 1},
@@ -541,8 +689,9 @@ function bestguns.register_gun(name, def)
       groups.direct_loading = 1
     end
     
-    -- Create the gun tool
-    core.register_tool(name, {
+    -- Create the gun tool (":" overrides the modname-prefix check so packs in
+    -- their own mods can register "bestguns:"-namespaced tools via this API).
+    core.register_tool(":" .. name, {
         description = def.description,
         inventory_image = def.texture_nomag,
         wield_image = def.texture_nomag,
@@ -551,7 +700,9 @@ function bestguns.register_gun(name, def)
         
         -- Left Click: Fire
         on_use = function(itemstack, user, pointed_thing)
-            if def.action ~= "full" then
+            if def.action == "burst" then
+                return bestguns.fire_burst(itemstack, user) or itemstack
+            elseif def.action ~= "full" then
                 local new_stack = bestguns.fire_gun(itemstack, user)
                 return new_stack or itemstack
             end
@@ -612,4 +763,9 @@ core.register_globalstep(function(dtime)
 end)
 
 
-dofile(path .. "/register.lua")
+dofile(path .. "/guninfo.lua")
+
+-- The actual weapon rosters now live in separate mods that depend on bestguns:
+--   * bestguns_guns        - realistic firearm set (was real_register.lua)
+--   * battlefront_blasters - Star Wars Battlefront blasters (was battlefront_register.lua)
+-- bestguns itself is now purely the API + shared effects + /guninfo.
