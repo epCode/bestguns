@@ -96,6 +96,21 @@ function bestguns.explode(self, pos)
   end
 end
 
+-- Shortest distance from point `p` to the segment `a`->`b`. Used so a fast
+-- bullet whizzes past a player based on its closest approach along the whole
+-- step it travelled, not just its (possibly already-passed) end position.
+local function dist_point_segment(p, a, b)
+  local ab = vector.subtract(b, a)
+  local len2 = vector.dot(ab, ab)
+  local t = 0
+  if len2 > 0 then
+    t = vector.dot(vector.subtract(p, a), ab) / len2
+    t = math.max(0, math.min(1, t))
+  end
+  local closest = vector.add(a, vector.multiply(ab, t))
+  return vector.distance(p, closest), closest
+end
+
 core.register_entity("bestguns:bullet", {
     initial_properties = {
         physical = false,
@@ -244,6 +259,35 @@ core.register_entity("bestguns:bullet", {
         if not self.shooter_name then return end
         local shooter = core.get_player_by_name(self.shooter_name)
 
+        -- Whiz-by: as the round passes a player (other than the shooter) it plays
+        -- a positional "whiz" from its closest approach, once per player per
+        -- bullet. Bullets set `whiz_sound = false` to stay silent, or override the
+        -- trigger radius with `whiz_distance`.
+        local b_def = self._item and bestguns.registered_bullets[self._item]
+        local whiz_sound = bestguns.default_whiz_sound
+        if b_def and b_def.whiz_sound ~= nil then whiz_sound = b_def.whiz_sound or nil end
+        if whiz_sound then
+          local trigger = (b_def and b_def.whiz_distance) or bestguns.whiz_distance
+          self._whizzed = self._whizzed or {}
+          for _, player in ipairs(core.get_connected_players()) do
+            local pname = player:get_player_name()
+            if pname ~= self.shooter_name and not self._whizzed[pname] then
+              local ppos = vector.offset(player:get_pos(), 0, 1.3, 0)
+              local d, closest = dist_point_segment(ppos, pos, next_pos)
+              -- Skip near-direct hits (those are handled as an impact, not a miss).
+              if d < trigger and d > 0.7 then
+                self._whizzed[pname] = true
+                core.sound_play(whiz_sound, {
+                  pos = closest,
+                  to_player = pname,
+                  gain = math.max(0.25, 1 - d / trigger),
+                  max_hear_distance = bestguns.whiz_hear_distance,
+                }, true)
+              end
+            end
+          end
+        end
+
         -- Execute Raycast for precise high-speed hit detection
         local ray = core.raycast(pos, next_pos, true, false)
         for pointed_thing in ray do
@@ -311,7 +355,7 @@ core.register_entity("bestguns:bullet", {
                     -- Hit feedback to the shooter: a momentary "x" hitmarker
                     -- (yellow on a headshot) plus a sound cue.
                     local shooter_player = self.shooter_name and core.get_player_by_name(self.shooter_name)
-                    if shooter_player then
+                    if shooter_player and obj:is_player() then
                         local snd = headshot and bestguns.headshot_sound or bestguns.hit_sound
                         if snd then
                             core.sound_play(snd, {to_player = self.shooter_name, gain = 1.0}, true)
@@ -326,7 +370,18 @@ core.register_entity("bestguns:bullet", {
                 local node = core.get_node(pointed_thing.under)
                 local def = core.registered_nodes[node.name]
                 if def and def.walkable then
-                  
+
+                  -- Impact sound, resolved from the node's name/groups (see
+                  -- bestguns.node_hit_sound) with the bullet's own default and
+                  -- the global "bestguns_hit_ground" as fallbacks.
+                  local hit_snd = bestguns.node_hit_sound(b_def, node)
+                  if hit_snd then
+                    core.sound_play(hit_snd, {
+                      pos = pointed_thing.intersection_point,
+                      gain = 1,
+                      max_hear_distance = 40,
+                    }, true)
+                  end
 
                   local lp = vector.add(pointed_thing.intersection_point, vector.multiply(self.velocity, -0.0001))
                   for i=1, math.random(1,self.damage*7) do

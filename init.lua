@@ -17,7 +17,69 @@ bestguns = {
     -- Defaults expect sounds/bestguns_hit.ogg and sounds/bestguns_headshot.ogg.
     hit_sound = "bestguns_hit",
     headshot_sound = "bestguns_headshot",
+
+    -- Default sound a bullet plays where it strikes a walkable node, and the
+    -- default "whiz" a bullet plays to nearby players as it flies past. A bullet
+    -- def overrides these per-bullet with `hit_node_sound` / `whiz_sound` (set
+    -- either to false to silence that bullet). Node-/group-specific impact
+    -- sounds are looked up in the registries below first.
+    default_hit_node_sound = "bestguns_hit_ground",
+    default_whiz_sound = "bestguns_whiz",
+
+    -- How close (metres) a bullet must pass to a player for that player to hear
+    -- the whiz, and how far away the whiz is still audible. A bullet def may
+    -- override the trigger radius with `whiz_distance`.
+    whiz_distance = 5,
+    whiz_hear_distance = 20,
+
+    -- Node-name and node-group -> impact-sound registries, consulted (node name
+    -- first, then groups) when a bullet hits a walkable node, before falling
+    -- back to the bullet's own `hit_node_sound` or `default_hit_node_sound`.
+    -- Populate via bestguns.set_node_hit_sound / bestguns.set_group_hit_sound,
+    -- e.g. bestguns.set_group_hit_sound("cracky", "bestguns_hit_metal").
+    node_hit_sounds = {},
+    group_hit_sounds = {},
 }
+
+-- Register a node-name- or node-group-specific bullet impact sound. Pass a
+-- sound name (string) to set one, or false to explicitly silence hits on that
+-- node/group (overriding the per-bullet and global defaults).
+function bestguns.set_node_hit_sound(node_name, sound)
+    bestguns.node_hit_sounds[node_name] = sound
+end
+function bestguns.set_group_hit_sound(group_name, sound)
+    bestguns.group_hit_sounds[group_name] = sound
+end
+
+-- Resolve the impact sound for a bullet striking `node`. Lookup order:
+--   1. bullet_def.hit_node_sounds[node.name]      (per-bullet, exact node)
+--   2. bestguns.node_hit_sounds[node.name]        (global, exact node)
+--   3. bullet_def.hit_node_sounds["group:"..grp]  (per-bullet, by group)
+--   4. bestguns.group_hit_sounds[grp]             (global, by group)
+--   5. bullet_def.hit_node_sound                  (bullet's own default)
+--   6. bestguns.default_hit_node_sound            (global default)
+-- Any level may hold `false` to explicitly mean "silent" (returns nil).
+function bestguns.node_hit_sound(bullet_def, node)
+    local ndef = core.registered_nodes[node.name] or {}
+    local per = bullet_def and bullet_def.hit_node_sounds
+
+    if per and per[node.name] ~= nil then return per[node.name] or nil end
+    if bestguns.node_hit_sounds[node.name] ~= nil then
+        return bestguns.node_hit_sounds[node.name] or nil
+    end
+
+    for g in pairs(ndef.groups or {}) do
+        if per and per["group:" .. g] ~= nil then return per["group:" .. g] or nil end
+        if bestguns.group_hit_sounds[g] ~= nil then
+            return bestguns.group_hit_sounds[g] or nil
+        end
+    end
+
+    if bullet_def and bullet_def.hit_node_sound ~= nil then
+        return bullet_def.hit_node_sound or nil
+    end
+    return bestguns.default_hit_node_sound
+end
 
 -- Overridable hook: return false to forbid a player from firing a given gun.
 -- Used by game integrations (e.g. CTF class restrictions). Defaults to allow.
@@ -46,7 +108,13 @@ function bestguns.scope(player, enable, itemstack, zoom_cancel)
   bestguns.playerphysics.remove_physics_factor(player, "speed", "bestguns:aiming_speed")
 
   if enable == "kick" then
-    player:set_fov((gundef.kick or 2.04)-1, true, 0.1)
+    -- `kick` is a recoil-strength number (~1.8 to 4), NOT a raw FOV multiplier.
+    -- Feeding it straight into set_fov's multiplier turned big-kick guns (deagle
+    -- kick=4 -> 3x FOV!) into nauseating fisheye punches. Map it to a gentle,
+    -- bounded widen instead: bigger kick still punches harder, but sanely.
+    -- (kick 2.04 -> ~1.04, matching the old baseline; kick 4 -> ~1.08.)
+    local punch = math.min(1 + (gundef.kick or 2.04) * 0.02, 1.2)
+    player:set_fov(punch, true, 0.1)
     return
   end
   
@@ -396,7 +464,7 @@ function bestguns.fire_gun(itemstack, user, charge_mult)
     -- Audio
     local snd = b_def.fire_sound or def.sound_fire
     if snd then
-        core.sound_play(snd, {pitch = (math.random(100)-50)*0.002+1, pos = user:get_pos(), gain = 19, max_hear_distance = 100}, true)
+        core.sound_play(snd, {pitch = (math.random(100)-50)*0.002+1, pos = user:get_pos(), gain = 3, max_hear_distance = 100}, true)
     end
 
     -- Recoil
