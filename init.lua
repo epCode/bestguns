@@ -4,6 +4,8 @@ bestguns = {
     last_fire = {}, -- Tracks cooldowns: [player_name] = timestamp
     burst_start = {}, -- First-shot-accuracy ramp: [player_name] = burst start time
     bursting = {}, -- Burst-fire lock: [player_name] = true while a burst is in progress
+    charge_start = {}, -- Hold-to-charge guns: [player_name] = charge start timestamp
+    charge_hud = {}, -- Hold-to-charge guns: [player_name] = charge % hud id
 
     -- Global multiplier applied to all bullet damage. CTF (and any game that
     -- scales player HP up) leaves this at 1; standalone/vanilla-HP games can
@@ -66,7 +68,7 @@ function bestguns.scope(player, enable, itemstack, zoom_cancel)
   bestguns[name].hud = {}
   bestguns[name].hud[1] = player:hud_add({
     type = "image",
-    text = "bestguns_scope.png",
+    text = gundef.scope_texture or "bestguns_scope.png",
     position = {x=0.5, y=0.5},
     scale = {x = 20*gundef.scope_size, y = 20*gundef.scope_size},
     alignment = {x=0, y=0},
@@ -74,7 +76,7 @@ function bestguns.scope(player, enable, itemstack, zoom_cancel)
   })
   bestguns[name].hud[2] = player:hud_add({
     type = "image",
-    text = "bestguns_scope_hud_cover.png",
+    text = gundef.scope_hud_texture or "bestguns_scope_hud_cover.png",
     position = {x=0.5, y=0.5},
     scale = {x = 300*gundef.scope_size, y = 300*gundef.scope_size},
     alignment = {x=0, y=0},
@@ -262,6 +264,25 @@ function bestguns.make_mag(gun_name, ammo_count, bullet_name)
     return stack
 end
 
+-- Deduct `count` rounds from a gun's currently-loaded ammo in one go (for actions
+-- that spend more than one round at once, e.g. an alt-fire that burns a chunk of
+-- the cell) and refresh its description/texture to match. Clamps at 0; callers
+-- that need to know whether enough ammo was available should check
+-- itemstack:get_meta():get_int("ammo_count") themselves before calling this,
+-- same as the ammo_count field always required. Returns the new ammo count.
+function bestguns.consume_ammo(itemstack, count)
+    local def = bestguns.registered_guns[itemstack:get_name()]
+    if not def then return 0 end
+
+    local meta = itemstack:get_meta()
+    local ammo = math.max(meta:get_int("ammo_count") - count, 0)
+    meta:set_int("ammo_count", ammo)
+    if ammo == 0 then meta:set_string("bullet_name", "") end
+
+    update_gun_desc(itemstack, def)
+    return ammo
+end
+
 function bestguns.can_fire(itemstack, user)
   local player_name = user:get_player_name()
   local gun_name = itemstack:get_name()
@@ -289,7 +310,9 @@ function bestguns.can_fire(itemstack, user)
 end
 
 -- Main firing function (Supports Semi, Full, and Manual)
-function bestguns.fire_gun(itemstack, user)
+-- `charge_mult` (optional): damage/velocity scale for hold-to-charge guns (action ==
+-- "charge"), 1 for a fully-charged shot. Ignored (treated as 1) by every other gun.
+function bestguns.fire_gun(itemstack, user, charge_mult)
     local player_name = user:get_player_name()
     local gun_name = itemstack:get_name()
     local def = bestguns.registered_guns[gun_name]
@@ -333,7 +356,11 @@ function bestguns.fire_gun(itemstack, user)
     end
 
     
-    if def.cancel_scope_on_fire then
+    -- Guns with no ADS at all, or that replace RMB with a custom alt-fire, never
+    -- touch the scope/FOV kick on fire.
+    if def.no_ads or def.on_altfire then
+      -- no scope/kick
+    elseif def.cancel_scope_on_fire then
       bestguns.scope(user)
     else
       if user:get_player_control().RMB then
@@ -369,7 +396,7 @@ function bestguns.fire_gun(itemstack, user)
     -- Audio
     local snd = b_def.fire_sound or def.sound_fire
     if snd then
-        core.sound_play(snd, {pitch = math.random(100)/500+1, pos = user:get_pos(), gain = 19, max_hear_distance = 100}, true)
+        core.sound_play(snd, {pitch = (math.random(100)-50)*0.002+1, pos = user:get_pos(), gain = 19, max_hear_distance = 100}, true)
     end
 
     -- Recoil
@@ -383,7 +410,8 @@ function bestguns.fire_gun(itemstack, user)
     local eye_height = user:get_properties().eye_height or 1.625
     local pos = vector.add(user:get_pos(), {x=0, y=eye_height, z=0})
     local eff_inaccuracy = def.inaccuracy * bloom
-    local bullet_vel = vector.multiply(vector.offset(dir, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy), b_def.speed or 100)
+    local speed_mult = (def.charge_scale_velocity and charge_mult) or 1
+    local bullet_vel = vector.multiply(vector.offset(dir, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy, bestguns.r(100)/5000*eff_inaccuracy), (b_def.speed or 100) * speed_mult)
 
     if def.on_fire then
       if def.on_fire(itemstack, user, obj) then
@@ -403,7 +431,7 @@ function bestguns.fire_gun(itemstack, user)
         shooter_name = player_name,
         _item = bullet_name,
         _drops = b_def.drops,
-        damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale),
+        damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale * (charge_mult or 1)),
         texture = b_def.texture,
         size = b_def.size or 1
     }))
@@ -478,18 +506,116 @@ bestguns.controls.register_on_press(function(player, key)
   local ctrl = player:get_player_control()
   local wielditem = player:get_wielded_item()
   if core.get_item_group(wielditem:get_name(), "bestguns_gun") == 0 then return end
-  if key == "RMB" and not ctrl.LMB and not ctrl.sneak then bestguns.scope(player, true, wielditem) end
+  local def = bestguns.registered_guns[wielditem:get_name()]
+  if key == "RMB" and not ctrl.LMB and not ctrl.sneak then
+    -- A gun with a custom on_altfire owns RMB entirely; no_ads means RMB does
+    -- nothing at all; otherwise fall back to the default ADS/scope behaviour.
+    if def and def.on_altfire then
+      def.on_altfire(wielditem, player, "press")
+    elseif not (def and def.no_ads) then
+      bestguns.scope(player, true, wielditem)
+    end
+  end
 end)
 bestguns.controls.register_on_release(function(player, key, length)
-  if key == "RMB" then bestguns.scope(player) end
+  if key == "RMB" then
+    local wielditem = player:get_wielded_item()
+    local def = bestguns.registered_guns[wielditem:get_name()]
+    if def and def.on_altfire then
+      def.on_altfire(wielditem, player, "release")
+    elseif not (def and def.no_ads) then
+      bestguns.scope(player)
+    end
+  end
   if key ~= "RMB" then return end
   reload_timer[player:get_player_name()] = 0
   bestguns.playerphysics.remove_physics_factor(player, "speed", "bestguns:loading_speed")
+end)
+
+-- Hold-to-charge guns (action == "charge"): holding LMB ramps a charge value from
+-- 0 to 1 over `charge_time` seconds; releasing fires with damage (and optionally
+-- velocity) scaled between `charge_min_mult` and 1. A HUD percentage under the
+-- crosshair keeps the player informed of the current charge.
+local function bestguns_charge_def(player)
+  local wielditem = player:get_wielded_item()
+  local def = bestguns.registered_guns[wielditem:get_name()]
+  if def and def.action == "charge" then return def, wielditem end
+  return nil
+end
+
+local function bestguns_remove_charge_hud(name)
+  local hud_id = bestguns.charge_hud[name]
+  if hud_id then
+    local player = core.get_player_by_name(name)
+    if player then player:hud_remove(hud_id) end
+    bestguns.charge_hud[name] = nil
+  end
+end
+
+bestguns.controls.register_on_press(function(player, key)
+  if key ~= "LMB" then return end
+  local def = bestguns_charge_def(player)
+  if not def then return end
+  local name = player:get_player_name()
+  bestguns.charge_start[name] = core.get_us_time() / 1000000
+  bestguns_remove_charge_hud(name)
+  bestguns.charge_hud[name] = player:hud_add({
+    hud_elem_type = "text",
+    position = {x = 0.5, y = 0.5},
+    alignment = {x = 0, y = 1},
+    offset = {x = 0, y = 30},
+    text = "0%",
+    number = 0xFFFFFF,
+    z_index = 100,
+  })
+end)
+
+bestguns.controls.register_on_hold(function(player, key, length)
+  if key ~= "LMB" then return end
+  local name = player:get_player_name()
+  local start = bestguns.charge_start[name]
+  local hud_id = bestguns.charge_hud[name]
+  if not start or not hud_id then return end
+  local def = bestguns_charge_def(player)
+  if not def then return end
+  local frac = math.min((core.get_us_time() / 1000000 - start) / (def.charge_time or 1), 1)
+  player:hud_change(hud_id, "text", math.floor(frac * 100) .. "%")
+end)
+
+bestguns.controls.register_on_release(function(player, key, length)
+  if key ~= "LMB" then return end
+  local name = player:get_player_name()
+  local start = bestguns.charge_start[name]
+  bestguns.charge_start[name] = nil
+  bestguns_remove_charge_hud(name)
+  if not start then return end
+
+  local def, wielditem = bestguns_charge_def(player)
+  if not def then return end
+
+  local frac = math.min((core.get_us_time() / 1000000 - start) / (def.charge_time or 1), 1)
+  if frac < (def.charge_min or 0) then
+    if def.sound_empty then
+      core.sound_play(def.sound_empty, {pos = player:get_pos(), max_hear_distance = 16}, true)
+    end
+    return
+  end
+
+  local min_mult = def.charge_min_mult or 0.35
+  local charge_mult = min_mult + (1 - min_mult) * frac
+  local new_stack = bestguns.fire_gun(wielditem, player, charge_mult)
+  if new_stack then player:set_wielded_item(new_stack) end
 end)
 bestguns.controls.register_on_hold(function(user, key, length)
   if key ~= "RMB" then return end
   local itemstack = user:get_wielded_item()
   local stackname = itemstack:get_name() or "ignore"
+
+  local altfire_def = bestguns.registered_guns[stackname:gsub("_mag$", "")]
+  if altfire_def and altfire_def.on_altfire then
+    altfire_def.on_altfire(itemstack, user, "hold")
+  end
+
   local direct = core.get_item_group(stackname, "direct_loading") ~= 0
   if core.get_item_group(stackname, "gun_magazine") == 0 and not direct then return end
     
@@ -702,6 +828,10 @@ function bestguns.register_gun(name, def)
         on_use = function(itemstack, user, pointed_thing)
             if def.action == "burst" then
                 return bestguns.fire_burst(itemstack, user) or itemstack
+            elseif def.action == "charge" then
+                -- Hold-to-charge guns fire on LMB release, driven by the
+                -- controls.register_on_press/on_hold/on_release hooks below.
+                return itemstack
             elseif def.action ~= "full" then
                 local new_stack = bestguns.fire_gun(itemstack, user)
                 return new_stack or itemstack

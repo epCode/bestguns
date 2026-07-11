@@ -40,6 +40,62 @@ core.register_on_leaveplayer(function(player)
   bestguns.hitmarkers[player:get_player_name()] = nil
 end)
 
+-- Splash-damage explosion for an explosive bullet (bullet def sets
+-- `splash_radius`), e.g. a grenade-style secondary fire. Every object within
+-- `radius` of `pos` takes damage falling off linearly from `self.damage` at the
+-- centre to 0 at the edge - the shooter is NOT excluded, so standing too close
+-- to your own blast can hurt you, same as the real weapon this is modelled on.
+function bestguns.explode(self, pos)
+  local radius = self._splash_radius or 0
+  if radius <= 0 then return end
+
+  local shooter = self.shooter_name and core.get_player_by_name(self.shooter_name)
+  local puncher = (shooter and shooter:is_valid()) and shooter or self.object
+
+  for _, obj in ipairs(core.get_objects_inside_radius(pos, radius)) do
+    if obj:is_valid() then
+      local opos = obj:get_pos()
+      local dist = vector.distance(pos, opos)
+      local dmg = math.max(math.floor(self.damage * (1 - dist / radius)), 0)
+      if dmg > 0 then
+        local dir = dist > 0.05 and vector.direction(pos, opos) or vector.new(0, 1, 0)
+        obj:punch(puncher, 1.0, {
+          full_punch_interval = 1.0,
+          damage_groups = {fleshy = dmg, ranged = 1, splash = 1}
+        }, dir)
+      end
+    end
+  end
+
+  -- Explosion visuals: a bright flash burst plus a lingering smoke cloud, built
+  -- from the pack's existing shared textures (no new art needed).
+  for _ = 1, math.random(8, 14) do
+    core.add_particle({
+      pos = pos,
+      velocity = {x = bestguns.r(8), y = bestguns.r(8), z = bestguns.r(8)},
+      expirationtime = 0.15,
+      size = math.random(14, 22),
+      texture = "bestguns_muzzle_flash.png^[opacity:" .. math.random(50, 90),
+      glow = 14,
+    })
+  end
+  for _ = 1, math.random(14, 22) do
+    core.add_particle({
+      pos = vector.offset(pos, bestguns.r(0.6), bestguns.r(0.4), bestguns.r(0.6)),
+      velocity = {x = bestguns.r(1), y = math.random(1, 3), z = bestguns.r(1)},
+      acceleration = {x = 0, y = 1, z = 0},
+      expirationtime = math.random(6, 14) / 10,
+      size = math.random(10, 22),
+      texture = "bestguns_smoke_" .. math.random(3) .. ".png^[opacity:" .. math.random(30, 70),
+      glow = math.random(3, 8),
+    })
+  end
+
+  if self._impact_sound then
+    core.sound_play(self._impact_sound, {pos = pos, gain = 1.2, max_hear_distance = 60}, true)
+  end
+end
+
 core.register_entity("bestguns:bullet", {
     initial_properties = {
         physical = false,
@@ -79,6 +135,22 @@ core.register_entity("bestguns:bullet", {
         self._falloff_end = b_def.falloff_end
       end
       self.start_pos = self.object:get_pos()
+
+      -- Optional per-bullet gravity (m/s^2), so a slugthrower-style round can arc
+      -- and drop instead of flying arrow-straight like the default energy bolt.
+      self._gravity = b_def and b_def.gravity
+
+      -- Per-bullet override of the headshot hit-zone damage multiplier (default
+      -- matches the flat 1.8x every bullet used before this was overridable).
+      self._headshot_mult = (b_def and b_def.headshot_mult) or 1.8
+
+      -- Explosive/splash bullets (e.g. a grenade-style secondary fire): on its
+      -- first impact (object or walkable node) the bullet detonates instead of
+      -- doing a single-target hit, damaging everyone within `splash_radius`
+      -- (falling off linearly to 0 at the edge) - including the shooter, who can
+      -- catch their own blast at close range. See bestguns.explode() below.
+      self._splash_radius = b_def and b_def.splash_radius
+      self._impact_sound = b_def and b_def.impact_sound
 
       -- Visual: a bullet def may render as a MESH (e.g. a glowing blaster bolt)
       -- instead of the default flat sprite. Mesh bolts auto-orient along their
@@ -147,8 +219,12 @@ core.register_entity("bestguns:bullet", {
           self.damage = math.floor(self._dmg_max + (self._dmg_min - self._dmg_max) * f)
         end
 
+        if self._gravity then
+          self.velocity.y = self.velocity.y - self._gravity * dtime
+        end
+
         local drag = 0.001
-        
+
         local in_node = core.get_node(pos)
         local in_def = core.registered_nodes[in_node.name] or {}
         if in_def.liquidtype ~= "none" then
@@ -171,7 +247,23 @@ core.register_entity("bestguns:bullet", {
         -- Execute Raycast for precise high-speed hit detection
         local ray = core.raycast(pos, next_pos, true, false)
         for pointed_thing in ray do
-            if pointed_thing.type == "object" then
+            if self._splash_radius then
+                local impact
+                if pointed_thing.type == "object" and pointed_thing.ref and pointed_thing.ref:is_valid() then
+                    impact = pointed_thing.intersection_point
+                elseif pointed_thing.type == "node" then
+                    local node = core.get_node(pointed_thing.under)
+                    local ndef = core.registered_nodes[node.name]
+                    if ndef and ndef.walkable then
+                        impact = pointed_thing.intersection_point
+                    end
+                end
+                if impact then
+                    bestguns.explode(self, impact)
+                    self.object:remove()
+                    return
+                end
+            elseif pointed_thing.type == "object" then
                 local obj = pointed_thing.ref
                 -- Prevent the shooter from hitting themselves
                 if obj and obj:is_valid() and obj ~= shooter then
@@ -196,7 +288,7 @@ core.register_entity("bestguns:bullet", {
                         local rel = ((ip.y - opos.y) - cbox[2]) / box_h
                         local zone
                         if rel >= 0.82 then
-                            zone = 1.8      -- head
+                            zone = self._headshot_mult -- head (per-bullet override, default 1.8)
                             headshot = true
                         elseif rel >= 0.40 then
                             zone = 1.0      -- torso
