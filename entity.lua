@@ -96,6 +96,106 @@ function bestguns.explode(self, pos)
   end
 end
 
+-- Is the node occupying world point `p` a liquid (water, lava, ...)? Unknown
+-- nodes count as non-liquid. Used to detect a bullet crossing a water surface.
+local function is_liquid_at(p)
+  local def = core.registered_nodes[core.get_node(p).name]
+  return def and def.liquidtype ~= "none" or false
+end
+
+-- Binary-search the liquid surface crossing point along the segment `a`->`b`,
+-- whose endpoints straddle the surface (one in liquid, one out). Returns a
+-- point sitting right on that surface so the splash spawns where it should.
+local function find_liquid_boundary(a, b)
+  local la = is_liquid_at(a)
+  for _ = 1, 7 do
+    local mid = vector.multiply(vector.add(a, b), 0.5)
+    if is_liquid_at(mid) == la then a = mid else b = mid end
+  end
+  return vector.multiply(vector.add(a, b), 0.5)
+end
+
+-- Splash a bullet makes crossing a liquid surface. `node` is the actual liquid
+-- node so the droplets are textured (and shaded) like the water they came from,
+-- exactly like the node-hit debris. Entry and exit are deliberately distinct:
+--   * ENTRY (bullet punching in): a crown of droplets bursting up and outward
+--     with a foam ring on the surface - a big, loud impact.
+--   * EXIT (bullet breaking out): a thinner spray flung forward along the
+--     bullet's travel direction with a little trailing foam - no crown, quieter.
+-- `damage` scales the splash: 30 is the baseline size, lower shrinks it (10 =
+-- small plip), higher grows it (60 = double). Guards a sane minimum so a
+-- near-zero-damage round still makes a visible ripple.
+function bestguns.water_splash(pos, velocity, node, exit, damage)
+  local speed = vector.length(velocity)
+  local dir = speed > 0.001 and vector.normalize(velocity) or vector.new(0, -1, 0)
+  local scale = math.max((damage or 30) / 30, 0.25)
+  local h_scale = scale / 2
+
+  -- Foam is a water thing - lava (and any hot/molten liquid) skips it entirely,
+  -- just throwing the molten droplets. Detected via the `lava` node group with a
+  -- name fallback for oddly-grouped moddedliquids.
+  local ndef = core.registered_nodes[node.name] or {}
+  local foam = not ((ndef.groups and ndef.groups.lava) or node.name:find("lava"))
+
+  core.sound_play("bestguns_splash", {
+    pos = pos,
+    gain = exit and 0.6 or 1.1,
+    max_hear_distance = 30,
+    pitch = exit and math.random(80, 120) / 100 or math.random(80, 120) / 100
+  }, true)
+
+  if not exit then
+    -- Crown of water droplets shooting up and out from the point of entry.
+    for _ = 1, math.random(12, math.ceil(20 * scale)) do
+      core.add_particle({
+        pos = vector.offset(pos, bestguns.r(0.15), 0, bestguns.r(0.15)),
+        velocity = {x = bestguns.r(2.5 * h_scale), y = math.random(20, 65 * h_scale) / 10, z = bestguns.r(2.5 * h_scale)},
+        acceleration = {x = 0, y = -9.81, z = 0},
+        expirationtime = math.random(4, 9) / 10,
+        collisiondetection = true,
+        size = math.random(6, 12) / 5,
+        node = node,
+      })
+    end
+    -- Foam ring bursting outward across the surface.
+    for _ = 1, foam and math.random(4, math.ceil(50 * scale)) or 0 do
+      core.add_particle({
+        pos = vector.offset(pos, bestguns.r(0.25), 0.02, bestguns.r(0.25)),
+        velocity = {x = bestguns.r(1.4 * h_scale), y = math.random(3, 100 * h_scale) / 10, z = bestguns.r(1.4 * h_scale)},
+        acceleration = {x = 0, y = -2, z = 0},
+        expirationtime = math.random(5, 10) / 10,
+        size = math.random(15, 28) / 30,
+        texture = "bestguns_foam.png^[opacity:" .. math.random(160, 230),
+      })
+    end
+  else
+    -- Thin spray of droplets dragged along the bullet's exit direction.
+    for _ = 1, math.random(5, 9) do
+      core.add_particle({
+        pos = vector.offset(pos, bestguns.r(0.1), 0, bestguns.r(0.1)),
+        velocity = vector.add(vector.multiply(dir, math.random(15, 35) / 10),
+          {x = bestguns.r(1), y = bestguns.r(1), z = bestguns.r(1)}),
+        acceleration = {x = 0, y = -9.81, z = 0},
+        expirationtime = math.random(3, 6) / 10,
+        collisiondetection = true,
+        size = math.random(4, 8) / 10 * scale,
+        node = node,
+      })
+    end
+    -- A wisp of foam trailing off the exit point.
+    for _ = 1, foam and math.random(2, 4) or 0 do
+      core.add_particle({
+        pos = vector.offset(pos, bestguns.r(0.15), 0, bestguns.r(0.15)),
+        velocity = vector.multiply(dir, math.random(5, 12) / 10),
+        acceleration = {x = 0, y = -3, z = 0},
+        expirationtime = math.random(3, 6) / 10,
+        size = math.random(8, 16) / 10 * scale,
+        texture = "bestguns_foam.png^[opacity:" .. math.random(120, 190),
+      })
+    end
+  end
+end
+
 -- Shortest distance from point `p` to the segment `a`->`b`. Used so a fast
 -- bullet whizzes past a player based on its closest approach along the whole
 -- step it travelled, not just its (possibly already-passed) end position.
@@ -109,6 +209,13 @@ local function dist_point_segment(p, a, b)
   end
   local closest = vector.add(a, vector.multiply(ab, t))
   return vector.distance(p, closest), closest
+end
+
+function vector.random(magnitude)
+  local x = (math.random() * 2 - 1) * magnitude
+  local y = (math.random() * 2 - 1) * magnitude
+  local z = (math.random() * 2 - 1) * magnitude
+  return {x = x, y = y, z = z}
 end
 
 core.register_entity("bestguns:bullet", {
@@ -135,14 +242,21 @@ core.register_entity("bestguns:bullet", {
 
       local b_def = self._item and bestguns.registered_bullets[self._item]
 
-      -- Distance-based damage falloff (Star Wars Battlefront style). A bullet def
-      -- may declare `damage_min`, `falloff_start` and `falloff_end` (metres). The
-      -- serialized `damage` is the already-scaled MAX; we derive the scaled MIN
-      -- from the same ratio so gun `damage_mult`/`damage_scale` are respected.
-      -- Bullets without these fields keep a constant damage (default behaviour).
+      -- Distance-based damage falloff (Star Wars Battlefront style). Damage ramps
+      -- from a MAX (the serialized `damage`) down to a MIN between two distances.
+      -- Two sources supply the falloff band, in priority order:
+      --   1. The firing gun's `gun_range`, stamped onto the spawn data at fire
+      --      time by bestguns.apply_range() (falloff_start/end + damage_min).
+      --   2. A bullet def declaring `damage_min`, `falloff_start`, `falloff_end`;
+      --      its MIN is rescaled by the gun's damage_mult/damage_scale ratio.
+      -- With neither, the bullet keeps constant damage (default behaviour).
       self._dmg_max = self.damage
       self._dmg_min = self.damage
-      if b_def and b_def.damage_min and b_def.damage and b_def.damage > 0
+      if data.falloff_start and data.falloff_end and data.damage_min then
+        self._dmg_min = data.damage_min
+        self._falloff_start = data.falloff_start
+        self._falloff_end = data.falloff_end
+      elseif b_def and b_def.damage_min and b_def.damage and b_def.damage > 0
          and b_def.falloff_start and b_def.falloff_end then
         local scale = self.damage / b_def.damage
         self._dmg_min = math.floor(b_def.damage_min * scale)
@@ -151,9 +265,19 @@ core.register_entity("bestguns:bullet", {
       end
       self.start_pos = self.object:get_pos()
 
-      -- Optional per-bullet gravity (m/s^2), so a slugthrower-style round can arc
-      -- and drop instead of flying arrow-straight like the default energy bolt.
-      self._gravity = b_def and b_def.gravity
+      -- Track whether the bullet is currently submerged so on_step can spot the
+      -- moment it crosses a liquid surface (in or out) and splash accordingly.
+      self._in_liquid = is_liquid_at(self.start_pos)
+
+      -- Bullet gravity (m/s^2): every round drops over distance. A bullet def may
+      -- override the gentle global default (bestguns.bullet_gravity) with its own
+      -- `gravity` - e.g. 0 for a dead-straight energy bolt, or a larger value for
+      -- a heavy slugthrower round that arcs noticeably.
+      if b_def and b_def.gravity ~= nil then
+        self._gravity = b_def.gravity
+      else
+        self._gravity = bestguns.bullet_gravity
+      end
 
       -- Per-bullet override of the headshot hit-zone damage multiplier (default
       -- matches the flat 1.8x every bullet used before this was overridable).
@@ -198,8 +322,16 @@ core.register_entity("bestguns:bullet", {
       end
 
       self.timer = 0
-      
-      
+
+      -- Faint bullet trail: emitted in on_step by dropping a puff at a fixed
+      -- spacing along the exact path the bullet travels (see there). `trail_carry`
+      -- keeps the spacing even across ticks. A bullet def sets `trail = false` to
+      -- disable it, or `trail_spacing` (metres) to tune the puff density.
+      self._trail = b_def and b_def.trail
+      self._trail_spacing = b_def and b_def.trail_spacing
+      self._trail_carry = 0
+
+
       if self._item and bestguns.registered_bullets[self._item].on_activate then
         return bestguns.registered_bullets[self._item].on_activate(self, dtime, moveresult)
       end
@@ -256,6 +388,89 @@ core.register_entity("bestguns:bullet", {
         --self.object:set_velocity(self.velocity)
 
         local next_pos = vector.add(pos, vector.multiply(self.velocity, dtime))
+
+        -- Water splash: bullets aren't stopped by liquids (the hit raycast below
+        -- ignores them), but crossing a liquid surface throws a splash. A bullet
+        -- moves several nodes per tick, so we can't just compare the two
+        -- endpoints - a fast round can dive in and punch back out of a thin sheet
+        -- of water in a single step, leaving both ends in air. Instead march the
+        -- segment in small samples and splash at every surface crossing found,
+        -- textured with the liquid node so the droplets match the water.
+        local seg = vector.subtract(next_pos, pos)
+        local seg_len = vector.length(seg)
+        if seg_len > 0 then
+          local step = 0.3
+          local sdir = vector.multiply(seg, 1 / seg_len)
+          local prev_pos, prev_liquid = pos, self._in_liquid
+          local d = step
+          while true do
+            local at_end = d >= seg_len
+            local sample_pos = at_end and next_pos or vector.add(pos, vector.multiply(sdir, d))
+            local sample_liquid = is_liquid_at(sample_pos)
+            if sample_liquid ~= prev_liquid then
+              local surface = find_liquid_boundary(prev_pos, sample_pos)
+              local water_node = core.get_node(sample_liquid and sample_pos or prev_pos)
+              bestguns.water_splash(surface, self.velocity, water_node, not sample_liquid, self.damage)
+              prev_liquid = sample_liquid
+            end
+            prev_pos = sample_pos
+            if at_end then break end
+            d = d + step
+          end
+          self._in_liquid = prev_liquid
+        end
+
+        -- Faint bullet trail. Drop a small puff at a fixed spacing along the exact
+        -- segment travelled this tick, so the trail is an even line no matter the
+        -- bullet's speed or the tick length. `_trail_carry` holds the leftover
+        -- distance past the last puff, so spacing stays consistent across ticks
+        -- instead of clumping at tick boundaries. Underwater the trail becomes a
+        -- line of foam bubbles drifting up, rather than the airborne smoke puff.
+        if self._trail ~= false then
+          local spacing = self._trail_spacing or 0.5
+          local seg = vector.subtract(next_pos, pos)
+          local seglen = vector.length(seg)
+          if seglen > 0 then
+            local dir = vector.multiply(seg, 1 / seglen)
+            local d = spacing - self._trail_carry
+            while d <= seglen do
+              local puff_pos = vector.add(pos, vector.multiply(dir, d))
+              -- Decide bubble-vs-smoke per puff, not per tick: a bullet moves
+              -- several nodes a tick and can straddle the surface, so testing the
+              -- tick-level self._in_liquid would draw bubbles along the airborne
+              -- stretch too. Sample the liquid state at this puff's own position.
+              if is_liquid_at(puff_pos) then
+                core.add_particle({ -- foam bubble wake, rising slowly
+                  pos = puff_pos,
+                  velocity = {x = bestguns.r(0.1), y = math.random(1, 3) / 10, z = bestguns.r(0.1)},
+                  acceleration = {x = 0, y = 0.15, z = 0},
+                  expirationtime = math.random(10, 22) / 10,
+                  size = math.random(6, 14) / 10,
+                  texture = {
+                    name = "bestguns_foam.png^[opacity:" .. math.random(120, 200),
+                    alpha_tween = {1, 0},
+                  },
+                  glow = 0,
+                })
+              else
+                core.add_particle({
+                  pos = puff_pos,
+                  velocity = vector.random(0.1),
+                  expirationtime = math.random(10, 20) / 5,
+                  size = math.random(10, 20) / 7,
+                  texture = {
+                    name = "bestguns_smoke_2.png^[opacity:60",
+                    alpha_tween = {1, 0},
+                  },
+                  glow = 0,
+                })
+              end
+              d = d + spacing
+            end
+            self._trail_carry = seglen - (d - spacing)
+          end
+        end
+
         if not self.shooter_name then return end
         local shooter = core.get_player_by_name(self.shooter_name)
 

@@ -4,6 +4,7 @@ bestguns = {
     last_fire = {}, -- Tracks cooldowns: [player_name] = timestamp
     burst_start = {}, -- First-shot-accuracy ramp: [player_name] = burst start time
     bursting = {}, -- Burst-fire lock: [player_name] = true while a burst is in progress
+    windup = {}, -- Hip-fire wind-up lock: [player_name] = true while the first shot of a hip-fired pull is delayed
     charge_start = {}, -- Hold-to-charge guns: [player_name] = charge start timestamp
     charge_hud = {}, -- Hold-to-charge guns: [player_name] = charge % hud id
 
@@ -11,6 +12,22 @@ bestguns = {
     -- scales player HP up) leaves this at 1; standalone/vanilla-HP games can
     -- lower it (e.g. 0.1) so guns tuned for 200 HP don't one-shot a 20-HP player.
     damage_scale = 1,
+
+    -- Distance damage falloff ("gun_range"). Each gun def carries a `gun_range`
+    -- (default 1) = the fraction of full range at which it stays lethal. A shot
+    -- does full damage out to `range_full * gun_range` metres, then scales down
+    -- linearly to `range_min_damage` of its damage at `range_zero * gun_range`
+    -- metres and beyond. Snipers use gun_range ~1 (hit hard far away), pistols
+    -- ~0.3 (fall off fast). A gun with gun_range <= 0 gets no falloff at all.
+    range_full = 25,
+    range_zero = 110,
+    range_min_damage = 0.35,
+
+    -- Default downward acceleration (m/s^2) applied to every bullet in flight so
+    -- rounds drop over distance. Set to real-world gravity so bullets arc like any
+    -- falling object. A bullet def overrides this with its own `gravity` (set 0 for
+    -- a dead-straight round).
+    bullet_gravity = 9.81,
 
     -- Sounds played to the shooter when a bullet lands on a target. Point these
     -- at your own ogg files (drop them in sounds/), or set to nil to disable.
@@ -85,6 +102,46 @@ end
 -- Used by game integrations (e.g. CTF class restrictions). Defaults to allow.
 function bestguns.can_use_gun(player, gun_name)
     return true
+end
+
+-- Public animation hook. Returns two values for third-person arm posing (see
+-- ctf_player's player animation):
+--   state      - the gun's action state, one of:
+--                  "aim"    - aiming down the sights (RMB held on an ADS gun)
+--                  "reload" - mid-reload: a magazine-fed gun with no magazine
+--                             inserted, or a direct/break-action gun held open
+--                  "hold"   - holding the gun at the ready (default)
+--   one_handed - true if the gun def sets `one_handed` (pistols, SMGs, etc.):
+--                such guns are held in the right hand only, so the animation
+--                leaves the support (left) arm on its normal swing.
+-- Returns nil when the player is not wielding a bestguns gun at all.
+function bestguns.player_gun_state(player)
+    local wielded = player:get_wielded_item()
+    local gun_name = wielded:get_name()
+    if core.get_item_group(gun_name, "bestguns_gun") == 0 then return nil end
+
+    local def = bestguns.registered_guns[gun_name]
+    local meta = wielded:get_meta()
+    local ctrl = player:get_player_control()
+    local one_handed = def and def.one_handed or false
+
+    -- Reloading: break/direct-action gun held open, or a magazine gun with its
+    -- magazine ejected (the pose the player holds while topping it back up).
+    if def then
+        if def.load_action == "direct" and meta:get_int("is_open") == 1 then
+            return "reload", one_handed
+        elseif def.load_action == "magazine" and meta:get_int("has_mag") == 0 then
+            return "reload", one_handed
+        end
+    end
+
+    -- Aiming down the sights: RMB, unless the gun has no ADS or repurposes RMB
+    -- for a custom alt-fire (in which case RMB isn't "aim").
+    if ctrl.RMB and def and not def.no_ads and not def.on_altfire then
+        return "aim", one_handed
+    end
+
+    return "hold", one_handed
 end
 
 function bestguns.scope(player, enable, itemstack, zoom_cancel)  
@@ -377,15 +434,76 @@ function bestguns.can_fire(itemstack, user)
   return true
 end
 
+-- Fire a loaded gun straight out of a dispenser (MineClone2 / Mineclonia), the
+-- way a dispenser shoots a bow. There's no player pulling the trigger, so this
+-- is a slimmed-down fire_gun: no ADS/recoil/spread-bloom (a dispenser has no
+-- aim state), just spend one round, play the shot at the dispenser, and launch a
+-- bullet along the dispenser's facing `dir` from `pos`. The bullet carries an
+-- empty shooter name = an environmental shot with no kill attribution (the
+-- bullet entity itself is the puncher). Always returns the (updated) gun stack
+-- so the dispenser keeps it - never returns nil, which would let the dispenser
+-- eject/consume the gun. Used by the `_on_dispense` hook on every gun tool.
+function bestguns.fire_from_dispenser(itemstack, pos, dir)
+    local def = bestguns.registered_guns[itemstack:get_name()]
+    if not def then return itemstack end
+
+    local meta = itemstack:get_meta()
+    local ammo = meta:get_int("ammo_count")
+    local is_open = meta:get_int("is_open") == 1
+
+    -- Can't fire: broken open, or empty. Click the empty sound and leave the gun
+    -- untouched in the dispenser.
+    if is_open or ammo <= 0 then
+        if def.sound_empty then
+            core.sound_play(def.sound_empty, {pos = pos, max_hear_distance = 16}, true)
+        end
+        return itemstack
+    end
+
+    local bullet_name = meta:get_string("bullet_name")
+    local b_def = bestguns.registered_bullets[bullet_name]
+    if not b_def then return itemstack end
+
+    -- Spend one round and refresh the gun's description/texture.
+    ammo = ammo - 1
+    meta:set_int("ammo_count", ammo)
+    if ammo == 0 then meta:set_string("bullet_name", "") end
+    update_gun_desc(itemstack, def)
+
+    -- Shot audio at the dispenser.
+    local snd = b_def.fire_sound or def.sound_fire
+    if snd then
+        core.sound_play(snd, {pitch = (math.random(100)-50)*0.002+1, pos = pos, gain = 3, max_hear_distance = 100}, true)
+    end
+
+    -- Launch the bullet down the dispenser's facing from just outside its mouth.
+    local data = {
+        velocity = vector.multiply(dir, b_def.speed or 100),
+        shooter_name = "", -- environmental shot: no player, no attribution
+        _item = bullet_name,
+        _drops = b_def.drops,
+        damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale),
+        texture = b_def.texture,
+        size = b_def.size or 1,
+    }
+    bestguns.apply_range(data, def)
+    local spawn = vector.add(pos, vector.multiply(dir, 0.6))
+    core.add_entity(spawn, "bestguns:bullet", core.serialize(data))
+
+    return itemstack
+end
+
 -- Main firing function (Supports Semi, Full, and Manual)
 -- `charge_mult` (optional): damage/velocity scale for hold-to-charge guns (action ==
 -- "charge"), 1 for a fully-charged shot. Ignored (treated as 1) by every other gun.
-function bestguns.fire_gun(itemstack, user, charge_mult)
+-- Internal: performs the actual shot (ammo, cooldown, recoil, bullet spawn).
+-- The public bestguns.fire_gun wraps this to add the hip-fire wind-up below.
+local function do_fire_gun(itemstack, user, charge_mult)
     local player_name = user:get_player_name()
     local gun_name = itemstack:get_name()
     local def = bestguns.registered_guns[gun_name]
-  
-    
+
+
     local can_fire, reason = bestguns.can_fire(itemstack, user)
     
     if reason == "click" then
@@ -494,7 +612,7 @@ function bestguns.fire_gun(itemstack, user, charge_mult)
         meta:set_string("bullet_name", "")
     end
     
-    local obj = core.add_entity(pos, "bestguns:bullet", core.serialize({
+    local data = {
         velocity = bullet_vel,
         shooter_name = player_name,
         _item = bullet_name,
@@ -502,11 +620,66 @@ function bestguns.fire_gun(itemstack, user, charge_mult)
         damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale * (charge_mult or 1)),
         texture = b_def.texture,
         size = b_def.size or 1
-    }))
+    }
+    bestguns.apply_range(data, def)
+    local obj = core.add_entity(pos, "bestguns:bullet", core.serialize(data))
 
     -- Custom on_fire callback
 
     return itemstack
+end
+
+-- Public fire entry point. Adds a one-time "wind-up": when you hip-fire (not
+-- aiming down the sights), the FIRST shot of a fresh trigger pull is delayed by
+-- the gun's wind-up time; every shot after that in the same pull fires at the
+-- gun's normal rate. Aiming (RMB on an ADS-capable gun) skips the wind-up
+-- entirely, so aiming rewards you with an instant trigger.
+--
+-- Wind-up length is per-gun via `def.hipfire_windup`, defaulting by action:
+-- full-auto guns get HIPFIRE_WINDUP, while semi/single-action guns fire
+-- instantly (0). A resolved value of 0 means no delay at all.
+--
+-- A "fresh" pull = the trigger has been at rest (no shot) for more than 0.15s,
+-- the same gap the spread-bloom reset uses. Pass `skip_windup` to fire
+-- immediately regardless (used by burst/charge, which are already deliberate).
+local HIPFIRE_WINDUP = 0.13
+local function gun_windup(def)
+    if def.hipfire_windup ~= nil then return def.hipfire_windup end
+    if def.action == "full" then return HIPFIRE_WINDUP end
+    return 0 -- semi/single-action guns fire instantly
+end
+function bestguns.fire_gun(itemstack, user, charge_mult, skip_windup)
+    local name = user:get_player_name()
+    local def = bestguns.registered_guns[itemstack:get_name()]
+    if not def then return nil end
+
+    -- A shot is already winding up for this player: don't stack another.
+    if bestguns.windup[name] then return nil end
+
+    local windup = gun_windup(def)
+    if not skip_windup and windup > 0 then
+        local ctrl = user:get_player_control()
+        local aiming = ctrl.RMB and not def.no_ads and not def.on_altfire
+        local now = core.get_us_time() / 1000000
+        local last_fire = bestguns.last_fire[name] or 0
+
+        if not aiming and (now - last_fire) > 0.15 then
+            -- Fresh hip-fire pull: delay only this first shot, then it's normal.
+            bestguns.windup[name] = true
+            core.after(windup, function()
+                bestguns.windup[name] = nil
+                local player = core.get_player_by_name(name)
+                if not player then return end
+                local wielded = player:get_wielded_item()
+                if wielded:get_name() ~= itemstack:get_name() then return end
+                local stack = do_fire_gun(wielded, player, charge_mult)
+                if stack then player:set_wielded_item(stack) end
+            end)
+            return itemstack
+        end
+    end
+
+    return do_fire_gun(itemstack, user, charge_mult)
 end
 
 -- Burst fire: one trigger pull sends a fixed number of rounds (default 3) spaced
@@ -522,8 +695,10 @@ function bestguns.fire_burst(itemstack, user)
     if bestguns.bursting[name] then return nil end
 
     -- Fire the first round immediately; bail (no lock) if it couldn't fire
-    -- (empty mag, cooldown, action restriction, etc.).
-    local first = bestguns.fire_gun(itemstack, user)
+    -- (empty mag, cooldown, action restriction, etc.). Burst rounds skip the
+    -- hip-fire wind-up: the burst's own `burst_delay` spacing already sets the
+    -- cadence, and a delayed first round would collide with the scheduled ones.
+    local first = bestguns.fire_gun(itemstack, user, nil, true)
     if not first then return nil end
 
     local shots = def.burst_count or 3
@@ -541,13 +716,27 @@ function bestguns.fire_burst(itemstack, user)
         if not player then bestguns.bursting[name] = nil return end
         local wielded = player:get_wielded_item()
         if wielded:get_name() ~= gun_name then bestguns.bursting[name] = nil return end
-        local new_stack = bestguns.fire_gun(wielded, player)
+        local new_stack = bestguns.fire_gun(wielded, player, nil, true)
         if new_stack then player:set_wielded_item(new_stack) end
         core.after(interval, function() shoot(i + 1) end)
     end
     core.after(interval, function() shoot(2) end)
 
     return first
+end
+
+-- Distance-falloff helper. Given a bullet's serialized spawn `data` (already
+-- holding the scaled max `damage`) and the firing gun's `def`, stamp the range
+-- falloff fields onto `data` so the bullet entity scales its damage down with
+-- distance based on the gun's `gun_range`. Guns with gun_range <= 0 are left
+-- untouched (constant damage). Shared by fire_gun and any custom on_fire that
+-- spawns bullets itself (e.g. shotguns).
+function bestguns.apply_range(data, def)
+    local gr = def and def.gun_range or 1
+    if gr <= 0 then return end
+    data.falloff_start = bestguns.range_full * gr
+    data.falloff_end   = bestguns.range_zero * gr
+    data.damage_min    = math.max(math.floor((data.damage or 0) * bestguns.range_min_damage), 1)
 end
 
 -- Bullet Registration
@@ -671,7 +860,9 @@ bestguns.controls.register_on_release(function(player, key, length)
 
   local min_mult = def.charge_min_mult or 0.35
   local charge_mult = min_mult + (1 - min_mult) * frac
-  local new_stack = bestguns.fire_gun(wielditem, player, charge_mult)
+  -- Charge guns fire on release after a deliberate hold; skip the hip-fire
+  -- wind-up so the shot goes off exactly when the player lets go.
+  local new_stack = bestguns.fire_gun(wielditem, player, charge_mult, true)
   if new_stack then player:set_wielded_item(new_stack) end
 end)
 bestguns.controls.register_on_hold(function(user, key, length)
@@ -909,7 +1100,13 @@ function bestguns.register_gun(name, def)
         on_place = rightclick_function,
         on_secondary_use = rightclick_function,
         range = 0,
-        
+
+        -- MineClone2 / Mineclonia: let a dispenser fire the gun like it fires a
+        -- bow. This field is inert in games without mcl_dispensers, so it's safe
+        -- to always define. `dropdir` is the dispenser's unit facing.
+        _on_dispense = function(stack, dispenserpos, droppos, dropnode, dropdir)
+            return bestguns.fire_from_dispenser(stack, dispenserpos, dropdir)
+        end,
     })
 end
 
