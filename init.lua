@@ -58,6 +58,14 @@ bestguns = {
     group_hit_sounds = {},
 }
 
+-- Outside Capture the Flag, players run on vanilla-ish HP (Mineclonia = 20)
+-- rather than CTF's scaled-up ~200, so guns tuned for CTF would one-shot
+-- everything. Detect "not CTF" by the absence of its core mod and knock all
+-- bullet damage down to a fifth. CTF (ctf_modebase present) keeps the full 1.0.
+if not (core.get_modpath("ctf_modebase") or core.get_modpath("ctf_core")) then
+    bestguns.damage_scale = 0.076
+end
+
 -- Register a node-name- or node-group-specific bullet impact sound. Pass a
 -- sound name (string) to set one, or false to explicitly silence hits on that
 -- node/group (overriding the per-bullet and global defaults).
@@ -103,6 +111,21 @@ end
 function bestguns.can_use_gun(player, gun_name)
     return true
 end
+
+-- [player_name] = the gun name the player most recently fired. Lets a spawned
+-- bullet attribute itself to the firing gun even when a custom on_fire (e.g. a
+-- shotgun's pellet spread) creates the bullet entity without stamping the gun
+-- name on it (see bestguns.on_shot / on_hit below and the bullet on_activate).
+bestguns.last_gun = {}
+
+-- Overridable accuracy hooks. No-ops by default, so bestguns carries no hard
+-- dependency on a stats mod; a stats mod replaces these to record per-gun
+-- shooting accuracy.
+--   on_shot: a bullet was fired by player `shooter_name` from gun `gun_name`.
+--   on_hit : a fired bullet struck player `target` (`headshot` true on a headshot),
+--            fired from gun `gun_name` by player `shooter_name`.
+function bestguns.on_shot(shooter_name, gun_name) end
+function bestguns.on_hit(shooter_name, gun_name, target, headshot) end
 
 -- Public animation hook. Returns two values for third-person arm posing (see
 -- ctf_player's player animation):
@@ -503,6 +526,10 @@ local function do_fire_gun(itemstack, user, charge_mult)
     local gun_name = itemstack:get_name()
     local def = bestguns.registered_guns[gun_name]
 
+    -- Remember the gun being fired so any bullet spawned during this shot (the
+    -- default one below, or pellets a custom on_fire launches) can attribute its
+    -- shot/hit to this gun. Set before on_fire runs so pellet spreads pick it up.
+    bestguns.last_gun[player_name] = gun_name
 
     local can_fire, reason = bestguns.can_fire(itemstack, user)
     
@@ -616,6 +643,7 @@ local function do_fire_gun(itemstack, user, charge_mult)
         velocity = bullet_vel,
         shooter_name = player_name,
         _item = bullet_name,
+        _gun = gun_name,
         _drops = b_def.drops,
         damage = math.floor((b_def.damage or 1) * (def.damage_mult or 1) * bestguns.damage_scale * (charge_mult or 1)),
         texture = b_def.texture,

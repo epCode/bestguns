@@ -3,6 +3,14 @@
 -- refresh the same element and reset its fade timer instead of stacking.
 bestguns.hitmarkers = bestguns.hitmarkers or {} -- [pname] = {id = hudid, job = <after handle>}
 
+-- Bullets batter a raised shield far harder than arrows. Mineclonia wears a
+-- blocking shield by roughly the damage it soaks (~6 for a bow's arrow) and
+-- ignores sub-3-damage hits outright, so bullets - especially our scaled-down
+-- rounds - would barely scratch one. Instead, every bullet a shield blocks eats
+-- this many points of durability directly: ~10x a typical arrow's ~6. Only
+-- applies where shields exist (Mineclonia); games without mcl_shields (CTF) skip it.
+local BULLET_SHIELD_WEAR = tonumber(core.settings:get("bestguns_bullet_shield_wear")) or 60
+
 function bestguns.show_hitmarker(player, headshot)
   if not player or not player:is_player() then return end
   local name = player:get_player_name()
@@ -37,7 +45,9 @@ function bestguns.show_hitmarker(player, headshot)
 end
 
 core.register_on_leaveplayer(function(player)
-  bestguns.hitmarkers[player:get_player_name()] = nil
+  local pname = player:get_player_name()
+  bestguns.hitmarkers[pname] = nil
+  bestguns.last_gun[pname] = nil
 end)
 
 -- Splash-damage explosion for an explosive bullet (bullet def sets
@@ -128,7 +138,7 @@ end
 function bestguns.water_splash(pos, velocity, node, exit, damage)
   local speed = vector.length(velocity)
   local dir = speed > 0.001 and vector.normalize(velocity) or vector.new(0, -1, 0)
-  local scale = math.max((damage or 30) / 30, 0.25)
+  local scale = math.max((damage or 30) / 30, 0.25) / bestguns.damage_scale
   local h_scale = scale / 2
 
   -- Foam is a water thing - lava (and any hot/molten liquid) skips it entirely,
@@ -146,7 +156,7 @@ function bestguns.water_splash(pos, velocity, node, exit, damage)
 
   if not exit then
     -- Crown of water droplets shooting up and out from the point of entry.
-    for _ = 1, math.random(12, math.ceil(20 * scale)) do
+    for _ = 1, math.random(12, math.ceil(20 * (scale))) do
       core.add_particle({
         pos = vector.offset(pos, bestguns.r(0.15), 0, bestguns.r(0.15)),
         velocity = {x = bestguns.r(2.5 * h_scale), y = math.random(20, 65 * h_scale) / 10, z = bestguns.r(2.5 * h_scale)},
@@ -162,9 +172,9 @@ function bestguns.water_splash(pos, velocity, node, exit, damage)
       core.add_particle({
         pos = vector.offset(pos, bestguns.r(0.25), 0.02, bestguns.r(0.25)),
         velocity = {x = bestguns.r(1.4 * h_scale), y = math.random(3, 100 * h_scale) / 10, z = bestguns.r(1.4 * h_scale)},
-        acceleration = {x = 0, y = -2, z = 0},
+        acceleration = {x = 0, y = -9.81, z = 0},
         expirationtime = math.random(5, 10) / 10,
-        size = math.random(15, 28) / 30,
+        size = math.random(18, 28) / 30,
         texture = "bestguns_foam.png^[opacity:" .. math.random(160, 230),
       })
     end
@@ -239,6 +249,17 @@ core.register_entity("bestguns:bullet", {
       self.damage = data.damage or 0
       self._item = data._item
       self._drops = data._drops or data._item
+
+      -- Attribute this bullet to the gun that fired it, for accuracy stats. Use
+      -- the gun stamped on the spawn data, falling back to the shooter's last
+      -- fired gun (covers pellets from a custom on_fire that don't stamp _gun).
+      -- Record the shot now that we know the gun; hits are recorded on impact.
+      if self.shooter_name and self.shooter_name ~= "" then
+        self._gun = data._gun or bestguns.last_gun[self.shooter_name]
+        if self._gun then
+          bestguns.on_shot(self.shooter_name, self._gun)
+        end
+      end
 
       local b_def = self._item and bestguns.registered_bullets[self._item]
 
@@ -562,10 +583,28 @@ core.register_entity("bestguns:bullet", {
                     local damage_groups = {fleshy = dmg, ranged = 1}
                     if headshot then damage_groups.headshot = 1 end
 
+                    -- A raised shield facing this bullet blocks the hit like any
+                    -- projectile, but bullets chew through it ~10x faster than an
+                    -- arrow: wear it down explicitly (see BULLET_SHIELD_WEAR). Guarded
+                    -- so it's a no-op in games without shields (e.g. CTF).
+                    if mcl_shields and obj:is_player() then
+                        local can_block = mcl_shields.can_block(obj, self.object:get_pos(),
+                            {type = "arrow", direct = self.object})
+                        if can_block then
+                            mcl_shields.add_wear(obj, BULLET_SHIELD_WEAR)
+                        end
+                    end
+
                     obj:punch(puncher, 1.0, {
                         full_punch_interval = 1.0,
                         damage_groups = damage_groups
                     }, self.velocity)
+
+                    -- Accuracy stats: a fired round struck a player. Bots and
+                    -- other non-player objects don't count toward hit-rate.
+                    if self.shooter_name and self.shooter_name ~= "" and self._gun and obj:is_player() then
+                        bestguns.on_hit(self.shooter_name, self._gun, obj, headshot)
+                    end
 
                     -- Hit feedback to the shooter: a momentary "x" hitmarker
                     -- (yellow on a headshot) plus a sound cue.
