@@ -315,6 +315,15 @@ core.register_entity("bestguns:bullet", {
       self._splash_radius = b_def and b_def.splash_radius
       self._impact_sound = b_def and b_def.impact_sound
 
+      -- Ricochet: a bullet may bounce off walkable nodes up to `bounces` times
+      -- (per-bullet def, or overridden per spawn via data._bounces) before it's
+      -- spent on the next node hit. Each bounce reflects the velocity about the
+      -- struck face and keeps `bounce_restitution` (default 0.5) of its speed. 0 =
+      -- the normal behaviour (destroyed on the first node hit). Grenade fragments
+      -- use this to ricochet off walls.
+      self._bounces = data._bounces or (b_def and b_def.bounces) or 0
+      self._bounce_restitution = (b_def and b_def.bounce_restitution) or 0.5
+
       -- Visual: a bullet def may render as a MESH (e.g. a glowing blaster bolt)
       -- instead of the default flat sprite. Mesh bolts auto-orient along their
       -- flight direction. Any bolt (sprite or mesh) may also set `glow`.
@@ -696,6 +705,24 @@ core.register_entity("bestguns:bullet", {
                   end
                   
                   local facedir = get_face_vector(pointed_thing.under, pointed_thing.intersection_point)
+
+                  -- Ricochet off the struck face if the bullet has bounces left.
+                  -- Reflect the velocity about the (axis-aligned) face normal by
+                  -- flipping its normal component, then damp the whole vector by the
+                  -- restitution. Nudge the bullet just off the surface so it doesn't
+                  -- immediately re-hit the same node, and end the tick here so it
+                  -- flies on from the impact point next step. Effects above still play.
+                  if self._bounces and self._bounces > 0 then
+                    self._bounces = self._bounces - 1
+                    if facedir.x ~= 0 then self.velocity.x = -self.velocity.x end
+                    if facedir.y ~= 0 then self.velocity.y = -self.velocity.y end
+                    if facedir.z ~= 0 then self.velocity.z = -self.velocity.z end
+                    self.velocity = vector.multiply(self.velocity, self._bounce_restitution)
+                    self.object:set_pos(vector.add(pointed_thing.intersection_point,
+                      vector.multiply(facedir, 0.05)))
+                    return
+                  end
+
                   local finaldir = vector.zero()
                   
                   for v,val in pairs(facedir) do
