@@ -526,6 +526,10 @@ local function do_fire_gun(itemstack, user, charge_mult)
     local gun_name = itemstack:get_name()
     local def = bestguns.registered_guns[gun_name]
 
+    -- Dead men don't shoot. Bail while the player is down (HP 0), which stops any
+    -- in-flight auto-fire/burst loop or queued shot from firing off after a kill.
+    if user:get_hp() <= 0 then return nil end
+
     -- Remember the gun being fired so any bullet spawned during this shot (the
     -- default one below, or pellets a custom on_fire launches) can attribute its
     -- shot/hit to this gun. Set before on_fire runs so pellet spreads pick it up.

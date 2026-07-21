@@ -249,6 +249,9 @@ core.register_entity("bestguns:bullet", {
       self.damage = data.damage or 0
       self._item = data._item
       self._drops = data._drops or data._item
+      -- Normally a bullet can't hit the player who fired it. Spawn data can set
+      -- _self_hit to lift that (e.g. grenade shards - your own frag can kill you).
+      self._self_hit = data._self_hit
 
       -- Attribute this bullet to the gun that fired it, for accuracy stats. Use
       -- the gun stamped on the spawn data, falling back to the shooter's last
@@ -351,6 +354,11 @@ core.register_entity("bestguns:bullet", {
       self._trail = b_def and b_def.trail
       self._trail_spacing = b_def and b_def.trail_spacing
       self._trail_carry = 0
+      -- Optional cap (in nodes) on how far the trail is drawn: once the bullet has
+      -- travelled this far the puffs stop, even though the bullet flies on. Set per
+      -- spawn via data._trail_max (e.g. grenade shards each stop at a random 2-9).
+      self._trail_max = data._trail_max
+      self._trail_traveled = 0
 
 
       if self._item and bestguns.registered_bullets[self._item].on_activate then
@@ -447,11 +455,13 @@ core.register_entity("bestguns:bullet", {
         -- distance past the last puff, so spacing stays consistent across ticks
         -- instead of clumping at tick boundaries. Underwater the trail becomes a
         -- line of foam bubbles drifting up, rather than the airborne smoke puff.
-        if self._trail ~= false then
+        if self._trail ~= false
+            and not (self._trail_max and self._trail_traveled >= self._trail_max) then
           local spacing = self._trail_spacing or 0.5
           local seg = vector.subtract(next_pos, pos)
           local seglen = vector.length(seg)
           if seglen > 0 then
+            self._trail_traveled = self._trail_traveled + seglen
             local dir = vector.multiply(seg, 1 / seglen)
             local d = spacing - self._trail_carry
             while d <= seglen do
@@ -545,8 +555,8 @@ core.register_entity("bestguns:bullet", {
                 end
             elseif pointed_thing.type == "object" then
                 local obj = pointed_thing.ref
-                -- Prevent the shooter from hitting themselves
-                if obj and obj:is_valid() and obj ~= shooter then
+                -- Prevent the shooter from hitting themselves (unless _self_hit).
+                if obj and obj:is_valid() and (self._self_hit or obj ~= shooter) then
                     -- Credit the shooting player so games (e.g. CTF) can attribute
                     -- kills/assists, and tag the hit as ranged damage.
                     local puncher = (shooter and shooter:is_valid()) and shooter or self.object
